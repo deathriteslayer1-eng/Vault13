@@ -1,0 +1,593 @@
+#FLIP 7 MONTE CARLO SIMULATOR
+#IB Mathematics AI Internal Assessment
+
+#Strategies:
+#1. Vibe Player
+#2. Probability-Aware Player
+#3. Expected Value Player
+
+
+import random
+import statistics
+from collections import Counter
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TRIALS = 10000
+FLIP7_BONUS = 15
+WIN_SCORE = 200
+
+# ============================================================
+# CARD DEFINITIONS
+# ============================================================
+
+def build_deck():
+    deck = []
+
+    # Number cards
+    for n in range(13):
+        copies = max(1, n)
+        deck.extend([("NUMBER", n)] * copies)
+
+    # guarantee proper copies
+    deck.remove(("NUMBER", 0))
+    deck.insert(0, ("NUMBER", 0))
+
+    # action cards
+    for _ in range(3):
+        deck.append(("ACTION", "FREEZE"))
+        deck.append(("ACTION", "FLIP3"))
+        deck.append(("ACTION", "SECOND_CHANCE"))
+
+    # modifier cards
+    deck.extend([
+        ("MOD", 2),
+        ("MOD", 4),
+        ("MOD", 6),
+        ("MOD", 8),
+        ("MOD", 10),
+        ("MOD", "X2")
+    ])
+
+    random.shuffle(deck)
+    return deck
+
+# ============================================================
+# PLAYER
+# ============================================================
+
+class Player:
+
+    def __init__(self, name, strategy):
+
+        self.name = name
+        self.strategy = strategy
+
+        self.reset_round()
+
+        self.total_score = 0
+
+    def reset_round(self):
+
+        self.numbers = set()
+        self.plus_cards = []
+
+        self.has_x2 = False
+        self.second_chance = False
+
+        self.active = True
+        self.frozen = False
+        self.busted = False
+        self.flip7 = False
+
+    @property
+    def unique_count(self):
+        return len(self.numbers)
+
+    def score_if_stop(self):
+
+        num_score = sum(self.numbers)
+
+        if self.has_x2:
+            num_score *= 2
+
+        num_score += sum(self.plus_cards)
+
+        if self.flip7:
+            num_score += FLIP7_BONUS
+
+        return num_score
+
+# ============================================================
+# PROBABILITY TOOLS
+# ============================================================
+
+def bust_probability(player, deck):
+
+    if not deck:
+         return 0
+
+    bust_cards = 0
+
+    for card_type, value in deck:
+
+        if card_type == "NUMBER":
+            if value in player.numbers:
+                bust_cards += 1
+
+    return bust_cards / len(deck)
+
+def safe_probability(player, deck):
+
+    return 1 - bust_probability(player, deck)
+
+def expected_next_value(player, deck):
+
+    if len(deck) == 0:
+        return 0
+
+    ev = 0
+
+    for card_type, value in deck:
+
+        if card_type == "NUMBER":
+
+            if value not in player.numbers:
+                ev += value
+
+        elif card_type == "MOD":
+
+            if value == "X2":
+                ev += sum(player.numbers)
+
+            else:
+                ev += value
+
+    return ev / len(deck)
+
+# ============================================================
+# STRATEGIES
+# ============================================================
+
+class VibeStrategy:
+
+    def should_hit(self, player, deck):
+        return random.random() < 0.66
+
+class ProbabilityStrategy:
+
+    def should_hit(self, player, deck):
+
+        p = bust_probability(player, deck)
+
+        if p < 0.20:
+            return random.random() < 0.90
+
+        if p < 0.40:
+            return random.random() < 0.60
+
+        if p < 0.60:
+            return random.random() < 0.40
+
+        return random.random() < 0.15
+
+class EVStrategy:
+
+    def should_hit(self, player, deck):
+
+        # Guaranteed score if player stops now
+        stay_value = player.score_if_stop()
+
+        # If score is 0, always keep exploring
+        if stay_value == 0:
+            return True
+
+        # Current probabilities
+        p_safe = safe_probability(player, deck)
+        p_bust = 1 - p_safe
+
+        # Existing helper function
+        ev_draw = expected_next_value(player, deck)
+
+        # ------------------------
+        # Flip 7 Bonus EV
+        # ------------------------
+
+        flip7_bonus_ev = 0
+
+        cards_needed = 7 - len(player.numbers)
+
+        if cards_needed == 1:
+
+            flip7_bonus_ev = 15 * p_safe
+
+        elif cards_needed == 2:
+
+            flip7_bonus_ev = 7.5 * p_safe
+
+        elif cards_needed == 3:
+
+            flip7_bonus_ev = 3 * p_safe
+
+        # ------------------------
+        # Second Chance Protection
+        # ------------------------
+
+        if player.second_chance:
+
+            # Second Chance protects one bust
+            p_bust *= 0.25
+
+        # ------------------------
+        # Risk Aversion
+        # ------------------------
+
+        RISK_FACTOR = 1.00
+
+        bust_penalty = (
+            p_bust
+            * stay_value
+            * RISK_FACTOR
+        )
+
+        # ------------------------
+        # EV of Continuing
+        # ------------------------
+
+        ev_continue = (
+            p_safe
+            * (
+                stay_value
+                + ev_draw
+                + flip7_bonus_ev
+            )
+        ) - bust_penalty
+
+        # ------------------------
+        # EV of Stopping
+        # ------------------------
+
+        ev_stay = stay_value
+
+        return ev_continue > ev_stay
+
+# ============================================================
+# ROUND ENGINE
+# ============================================================
+
+class Round:
+
+    def __init__(self, players):
+
+        self.players = players
+        self.deck = build_deck()
+
+    def active_players(self):
+
+        return [
+            p for p in self.players
+            if p.active
+        ]
+
+    def freeze_target(self, source):
+
+        candidates = [
+            p for p in self.players
+            if p.active and p != source
+        ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda p:p.score_if_stop()
+        )
+
+    def flip3_target(self, source):
+
+        candidates = [
+            p for p in self.players
+            if p.active and p != source
+        ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda p:bust_probability(
+                p,
+                self.deck
+            )
+        )
+
+    def draw_for_player(self, player):
+
+        if not self.deck:
+            return
+
+        card_type, value = self.deck.pop()
+
+        if card_type == "NUMBER":
+
+            if value in player.numbers:
+
+                if player.second_chance:
+
+                    player.second_chance = False
+                    return
+
+                player.busted = True
+                player.active = False
+                return
+
+            player.numbers.add(value)
+
+            if len(player.numbers) >= 7:
+                player.flip7 = True
+                player.active = False
+
+        elif card_type == "MOD":
+
+            if value == "X2":
+                player.has_x2 = True
+            else:
+                player.plus_cards.append(value)
+
+        elif card_type == "ACTION":
+
+            if value == "SECOND_CHANCE":
+                player.second_chance = True
+
+            elif value == "FREEZE":
+
+                target = self.freeze_target(player)
+
+                if target:
+                    target.active = False
+                    target.frozen = True
+
+            elif value == "FLIP3":
+
+                target = self.flip3_target(player)
+
+                if target:
+                    for _ in range(3):
+
+                        if target.active:
+                            self.draw_for_player(
+                                target
+                            )
+
+    def play(self):
+
+        for player in self.players:
+            player.reset_round()
+
+        while len(self.active_players()) > 0:
+
+            if not self.deck:
+                for player in self.active_players():
+                    player.active = False
+                break
+
+            for player in self.players:
+
+
+                if not player.active:
+                    continue
+
+                hit = player.strategy.should_hit(
+                    player,
+                    self.deck
+                )
+
+                if not hit:
+
+                    player.active = False
+                    continue
+
+                self.draw_for_player(player)
+
+# ============================================================
+# SIMULATION
+# ============================================================
+
+class Simulation:
+
+    def __init__(self, trials=10000):
+
+        self.trials = trials
+
+        self.results = {
+            "Vibe": [],
+            "Probability": [],
+            "EV": []
+        }
+
+        self.game_wins = {
+            "Vibe": 0,
+            "Probability": 0,
+            "EV": 0
+        }
+
+        self.total_busts = {
+            "Vibe": 0,
+            "Probability": 0,
+            "EV": 0
+        }
+
+        self.game_rounds = []
+
+    def run(self):
+
+        for _ in range(self.trials):
+
+            totals = {
+                "Vibe": 0,
+                "Probability": 0,
+                "EV": 0
+            }
+
+            busts = {
+                "Vibe": 0,
+                "Probability": 0,
+                "EV": 0
+            }
+
+            rounds_played = 0
+
+            while max(totals.values()) < WIN_SCORE:
+
+                rounds_played += 1
+
+                players = [
+                    Player("Vibe", VibeStrategy()),
+                    Player("Probability", ProbabilityStrategy()),
+                    Player("EV", EVStrategy())
+                ]
+
+                game = Round(players)
+                game.play()
+
+                for p in players:
+                    round_score = 0
+
+                    if p.busted:
+                        busts[p.name] += 1
+                    else:
+                        round_score = p.score_if_stop()
+
+                    totals[p.name] += round_score
+                    self.results[p.name].append(round_score)
+
+            winner = max(totals, key=totals.get)
+            self.game_wins[winner] += 1
+            self.game_rounds.append(rounds_played)
+
+            for strategy in busts:
+                self.total_busts[strategy] += busts[strategy]
+
+        self.report()
+
+    def report(self):
+
+        print()
+        print("=" * 50)
+        print("ROUND STATISTICS")
+        print("=" * 50)
+
+        for strategy, scores in self.results.items():
+
+            print()
+            print(strategy)
+
+            print(
+                "Mean:",
+                round(statistics.mean(scores), 2)
+            )
+
+            print(
+                "Median:",
+                round(statistics.median(scores), 2)
+            )
+
+            print(
+                "Max:",
+                max(scores)
+            )
+
+            print(
+                "Min:",
+                min(scores)
+            )
+
+            print(
+                "Std Dev:",
+                round(
+                    statistics.stdev(scores),
+                    2
+                )
+            )
+
+            bust_rate = (
+                scores.count(0)
+                / len(scores)
+            ) * 100
+
+            print(
+                "Bust Rate:",
+                round(bust_rate, 2),
+                "%"
+            )
+
+        print()
+        print("=" * 50)
+        print("FULL GAME ANALYSIS")
+        print("=" * 50)
+
+        for strategy in self.game_wins:
+
+            win_rate = (
+                self.game_wins[strategy]
+                / self.trials
+            ) * 100
+
+            avg_busts = (
+                self.total_busts[strategy]
+                / self.trials
+            )
+
+            print()
+            print(strategy)
+
+            print(
+                "Games Won:",
+                self.game_wins[strategy]
+            )
+
+            print(
+                "Win Rate:",
+                round(win_rate, 2),
+                "%"
+            )
+
+            print(
+                "Avg Busts Per Game:",
+                round(avg_busts, 2)
+            )
+
+        print()
+
+        print(
+            "Average Rounds Per Game:",
+            round(
+                statistics.mean(self.game_rounds),
+                2
+            )
+        )
+
+        print(
+            "Maximum Rounds:",
+            max(self.game_rounds)
+        )
+
+        print(
+            "Minimum Rounds:",
+            min(self.game_rounds)
+        )
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    sim = Simulation(
+        trials=TRIALS
+    )
+
+    sim.run()
